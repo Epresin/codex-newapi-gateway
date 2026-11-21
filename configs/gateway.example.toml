@@ -1,0 +1,112 @@
+# Codex New API Gateway configuration template.
+# Copy this file to ./config.toml and adjust for your environment.
+# No API keys or user credentials are stored in this file.
+
+[server]
+# Local run default: "127.0.0.1:17329"
+# Docker container:  "0.0.0.0:8080"
+listen = "127.0.0.1:17329"
+reject_browser_origin = true
+max_inspection_body_bytes = 67108864  # 64 MiB (used only when any model is disabled)
+max_models_response_bytes = 8388608   # 8 MiB
+
+[upstream]
+# Local New API:    "http://127.0.0.1:3000/v1"
+# Docker network:   "http://new-api:3000/v1"
+base_url = "http://127.0.0.1:3000/v1"
+connect_timeout_secs = 15
+read_timeout_secs = 600
+
+[auth]
+# Dedicated request header carrying the user's New API key.
+# Must not be "Authorization" or "Cookie".
+key_header = "X-NewAPI-Key"
+# Keep false when sharing Codex with ChatGPT login so ChatGPT tokens are never
+# forwarded to New API if the dedicated header is misconfigured.
+allow_bearer_fallback = false
+
+[metadata]
+enabled = true
+url = "https://models.dev/api.json"
+refresh_interval_secs = 21600
+fetch_timeout_secs = 30
+max_response_bytes = 33554432  # 32 MiB
+# Local run: "./data/cache"
+# Docker:    "/data/cache"
+cache_dir = "./data/cache"
+# Preferred provider namespaces when resolving bare model IDs in models.dev.
+canonical_providers = [
+  "openai",
+  "anthropic",
+  "google",
+  "xai",
+  "moonshotai",
+  "deepseek",
+  "mistral",
+  "cohere",
+  "meta",
+  "qwen",
+]
+
+[catalog]
+# Optional model ID sorted to priority 0 when present in the user's catalog.
+# default_model = "gpt-5"
+
+# Case-insensitive substrings (ignoring '-' and '_') hidden from the picker by default.
+# Hidden models remain enabled and usable unless explicitly disabled.
+hidden_keywords = ["image", "autoreview"]
+
+# Ordered preference list for `auto_review_model_override`.
+# The first enabled model present in the caller's permitted catalog is selected.
+auto_review_models = []
+# auto_review_models = ["codex-auto-review", "my-fast-model"]
+
+# Append formatted context size (e.g. "256k", "1m") to model descriptions.
+append_context_to_description = true
+
+# Advertise Codex's proactive delegation effort tier ("ultra").
+append_ultra_reasoning = true
+ultra_reasoning_description = "Codex proactive delegation mode"
+
+shell_type = "unified_exec"
+effective_context_window_percent = 95
+truncation_limit = 10000
+
+[defaults]
+compaction = { percent = 90 }
+context_window = 1000000
+reasoning_levels = ["high", "xhigh", "max"]
+default_reasoning = "xhigh"
+image_input = false
+reasoning_summary = false
+parallel_tools = false
+use_responses_lite = false
+service_tiers = [
+  { id = "priority", name = "Fast", description = "fast mode" },
+]
+additional_speed_tiers = ["fast"]
+
+# ---------------------------------------------------------------------------
+# Per-model sparse overrides (exact upstream model IDs).
+# Precedence: [models."<id>"] > models.dev > [defaults].
+# Overrides can narrow or enrich models permitted by the caller's New API key,
+# but never grant access to models the upstream key does not allow.
+# ---------------------------------------------------------------------------
+
+# [models."example-primary-model"]
+# source = "openai/gpt-5"
+# display_name = "Primary Model"
+# description = "Primary coding model"
+# visible = true
+# enabled = true
+# compaction = { percent = 80 }
+# extra_service_tiers = [
+#   { id = "ultrafast", name = "Ultrafast", description = "ultrafast mode" },
+# ]
+
+# [models."example-fast-model"]
+# description = "Fast, low-cost model for lightweight retrieval and edits"
+# visible = true
+
+# [models."example-blocked-model"]
+# enabled = false

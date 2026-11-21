@@ -1,0 +1,12 @@
+/target/
+/.acceptance/
+/.build-tools/
+/data/
+/config.toml
+/deploy/config.toml
+**/__pycache__/
+*.pyc
+*.tar.gz
+.env
+.DS_Store
+Thumbs.db

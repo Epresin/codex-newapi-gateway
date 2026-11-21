@@ -1,0 +1,34 @@
+# Codex client configuration snippet for ChatGPT sign-in + New API Gateway.
+# Merge into an isolated Codex profile first; do not overwrite an existing config.
+# Sign in with ChatGPT normally. Do not run API-key login or copy auth.json.
+
+model_provider = "newapi"
+model = "REPLACE_WITH_YOUR_DEFAULT_MODEL"
+model_reasoning_effort = "xhigh"
+web_search = "live"
+
+[features]
+standalone_web_search = true
+image_generation = true
+
+[model_providers.newapi]
+# Display name "OpenAI" enables OpenAI-compatible remote compaction in Codex.
+# The provider ID remains "newapi" so the built-in "openai" provider is untouched.
+name = "OpenAI"
+base_url = "https://gateway.example.com/codex"
+wire_api = "responses"
+requires_openai_auth = true
+supports_websockets = true
+supports_standalone_web_search = true
+
+# Option 1 (config-only): stores your New API key in plaintext locally.
+# Restrict file permissions and never commit your real config.
+# Never place a ChatGPT session token here.
+http_headers = { "X-NewAPI-Key" = "REPLACE_WITH_YOUR_NEW_API_KEY" }
+
+# Option 2 (environment variable): replace `http_headers` above with the line
+# below if the environment variable is already available to the Codex process.
+# env_http_headers = { "X-NewAPI-Key" = "NEWAPI_GATEWAY_KEY" }
+
+# Intentionally omitted: env_key, experimental_bearer_token, model_catalog_json,
+# and model_catalog_url. The signed-in Codex client fetches GET /models directly.
