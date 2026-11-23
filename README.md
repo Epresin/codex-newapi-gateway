@@ -14,7 +14,7 @@ Codex -> Nginx (/codex/) -> codex-newapi-gateway -> New API -> upstream channels
 - **按 Key 实时模型目录**：每次 `GET /models` 使用当前 Key 实时查询 New API，响应标记 `Cache-Control: no-store` 且按实际 `key_header` 输出 `Vary`，撤销即时生效、不跨用户缓存目录。
 - **公共元信息 + 稀疏覆盖**：自动同步 [models.dev](https://models.dev/api.json) 公共模型规格（支持 ETag 与本地磁盘缓存，失败时自动降级保留最后有效数据）。合并优先级：`[models."<id>"]` > `models.dev` > `[defaults]`。
 - **全配置化策略**：默认隐藏关键词、自动评审模型优先级（`auto_review_model_override`）、默认模型排序、服务档位（`service_tiers` / `extra_service_tiers`）、`ultra` 推理档位、上游超时和请求体上限均通过单一 TOML 文件配置，无私有模型硬编码。
-- **无损流式与双向 WebSocket 透传**：支持 HTTP/SSE 与 `GET /responses` WebSocket 升级字节级透传；拒绝上游重定向；不改写推理请求正文与 `service_tier`；日志仅输出方法、路径、状态码、时延和 WS 字节数，不记录 Key 或正文。
+- **无损流式与双向 WebSocket 透传**：支持 HTTP/SSE 与 `GET /responses` WebSocket 升级字节级透传；请求头采用精准协议白名单（完整透传 `session-id` / `thread-id` / `x-codex-turn-state` / `originator` / `openai-beta` / `x-openai-internal-codex-responses-lite` 等会话与特性头，严防官方身份头外泄），响应头采用安全黑名单透传（回传 `x-codex-turn-state`、限流与模型诊断头，剥离 hop-by-hop、`Set-Cookie`、`WWW-Authenticate`、`X-Models-Etag` 等）；拒绝上游重定向；不改写推理请求正文与 `service_tier`；日志仅输出方法、路径、状态码、时延和 WS 字节数，不记录 Key 或正文。
 
 ## 目录结构
 

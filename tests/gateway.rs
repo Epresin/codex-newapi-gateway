@@ -58,6 +58,13 @@ async fn upstream(State(s): State<Mock>, mut r: Request) -> Response {
             .header("connection", "upgrade")
             .header("upgrade", "websocket")
             .header("sec-websocket-accept", "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=")
+            .header("x-codex-turn-state", "ws-turn-state-1")
+            .header("x-codex-websocket-max-message-bytes", "16777216")
+            .header("openai-model", "gpt-5.4")
+            .header("x-reasoning-included", "true")
+            .header("x-oai-request-id", "oai-ws-req-1")
+            .header("set-cookie", "ws-secret=1")
+            .header("x-models-etag", "upstream-etag")
             .body(Body::empty())
             .unwrap();
     }
@@ -114,7 +121,31 @@ async fn upstream(State(s): State<Mock>, mut r: Request) -> Response {
             .status(429)
             .header("retry-after", "7")
             .header("set-cookie", "must-not-forward=1")
+            .header("x-codex-imagegen-request-id", "img-req-42")
             .body(Body::from("limited"))
+            .unwrap();
+    }
+    if p.uri.path() == "/v1/responses" && p.uri.query() == Some("header_probe=1") {
+        return Response::builder()
+            .status(200)
+            .header("content-type", "application/json")
+            .header("x-request-id", "req-outer-1")
+            .header("x-oai-request-id", "oai-req-1")
+            .header("x-codex-turn-state", "turn-state-resp-1")
+            .header("openai-model", "gpt-5.4")
+            .header("x-reasoning-included", "true")
+            .header("x-codex-primary-used-percent", "18.5")
+            .header("x-codex-safety-buffering-enabled", "false")
+            .header("x-ratelimit-remaining-requests", "99")
+            .header("set-cookie", "session=drop-me")
+            .header("www-authenticate", "Bearer realm=\"upstream\"")
+            .header("strict-transport-security", "max-age=31536000")
+            .header("access-control-allow-origin", "*")
+            .header("x-models-etag", "upstream-models-etag")
+            .header("connection", "keep-alive, x-custom-hop")
+            .header("keep-alive", "timeout=5")
+            .header("x-custom-hop", "must-be-stripped")
+            .body(Body::from(r#"{"ok":true}"#))
             .unwrap();
     }
     axum::Json(json!({"ok":true})).into_response()
@@ -989,5 +1020,193 @@ async fn custom_key_header_is_consumed_reflected_in_vary_and_not_forwarded() {
         for name in ["openai-project", "x-newapi-key", "chatgpt-account-id"] {
             assert!(!headers.contains_key(name));
         }
+    }
+}
+
+#[tokio::test]
+async fn http_request_allowlist_and_response_denylist_preserve_codex_protocol_headers() {
+    let f = fixture(Default::default()).await;
+    let client = reqwest::Client::new();
+    let forwarded_request_headers = [
+        ("openai-beta", "responses=2026-02-06"),
+        ("originator", "codex_cli_rs"),
+        ("version", "0.171.0-epr.1"),
+        ("session-id", "sess-123"),
+        ("session_id", "sess-legacy-123"),
+        ("thread-id", "thread-456"),
+        ("conversation_id", "conv-789"),
+        ("x-codex-turn-state", "turn-state-req-1"),
+        ("x-codex-turn-metadata", r#"{"thread_source":"cli"}"#),
+        ("x-client-request-id", "client-req-1"),
+        ("x-openai-internal-codex-responses-lite", "true"),
+        ("x-codex-beta-features", "multi_agent_v2"),
+        ("x-openai-subagent", "collab_spawn"),
+        ("x-codex-window-id", "win-1"),
+        ("x-codex-parent-thread-id", "parent-thread-1"),
+        ("x-codex-guardian", "reviewer"),
+        ("x-codex-routing-hint", "sticky-a"),
+    ];
+    let mut req = client
+        .post(format!("{}/responses?header_probe=1", f.base))
+        .header("X-NewAPI-Key", "key-a")
+        .bearer_auth("chatgpt-token")
+        .header("cookie", "secret=1")
+        .header("chatgpt-account-id", "private-account")
+        .header("x-openai-account-routing-override", "private-routing")
+        .header("x-codex-installation-id", "private-install-id")
+        .header("x-unexpected-private-header", "must-not-forward")
+        .header("content-type", "application/json");
+    for (name, value) in forwarded_request_headers {
+        req = req.header(name, value);
+    }
+    let response = req
+        .body(r#"{"model":"model-a","input":"hi"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+
+    // Upstream received all allowlisted Codex protocol headers and none of the sensitive/unknown ones.
+    let calls = f.mock.calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    let upstream_headers = &calls[0].1;
+    assert_eq!(upstream_headers["authorization"], "Bearer key-a");
+    for (name, value) in forwarded_request_headers {
+        assert_eq!(
+            upstream_headers.get(name).and_then(|v| v.to_str().ok()),
+            Some(value),
+            "expected request header {name} to be forwarded"
+        );
+    }
+    for stripped in [
+        "x-newapi-key",
+        "cookie",
+        "chatgpt-account-id",
+        "x-openai-account-routing-override",
+        "x-codex-installation-id",
+        "x-unexpected-private-header",
+    ] {
+        assert!(
+            !upstream_headers.contains_key(stripped),
+            "request header {stripped} must not be forwarded"
+        );
+    }
+
+    // Downstream received non-sensitive upstream response headers and none of the denylisted ones.
+    let resp_headers = response.headers();
+    for (name, value) in [
+        ("x-request-id", "req-outer-1"),
+        ("x-oai-request-id", "oai-req-1"),
+        ("x-codex-turn-state", "turn-state-resp-1"),
+        ("openai-model", "gpt-5.4"),
+        ("x-reasoning-included", "true"),
+        ("x-codex-primary-used-percent", "18.5"),
+        ("x-codex-safety-buffering-enabled", "false"),
+        ("x-ratelimit-remaining-requests", "99"),
+    ] {
+        assert_eq!(
+            resp_headers.get(name).and_then(|v| v.to_str().ok()),
+            Some(value),
+            "expected response header {name} to be forwarded"
+        );
+    }
+    for stripped in [
+        "set-cookie",
+        "www-authenticate",
+        "strict-transport-security",
+        "access-control-allow-origin",
+        "x-models-etag",
+        "keep-alive",
+        "x-custom-hop",
+    ] {
+        assert!(
+            !resp_headers.contains_key(stripped),
+            "response header {stripped} must be stripped"
+        );
+    }
+}
+
+#[tokio::test]
+async fn websocket_handshake_forwards_codex_headers_bidirectionally_and_strips_sensitive_ones() {
+    let f = fixture(Default::default()).await;
+    f.mock.websocket.store(true, Ordering::Relaxed);
+    let response = reqwest::Client::new()
+        .get(format!("{}/responses", f.base))
+        .header("X-NewAPI-Key", "key-a")
+        .bearer_auth("chatgpt-token")
+        .header("cookie", "private-session=1")
+        .header("chatgpt-account-id", "private-account")
+        .header("x-openai-account-routing-override", "private-routing")
+        .header("x-codex-installation-id", "private-install-id")
+        .header("connection", "upgrade")
+        .header("upgrade", "websocket")
+        .header("sec-websocket-version", "13")
+        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+        .header("openai-beta", "responses_websockets=2026-02-06")
+        .header("originator", "codex_cli_rs")
+        .header("session-id", "ws-sess-1")
+        .header("thread-id", "ws-thread-1")
+        .header("x-codex-turn-state", "ws-turn-req-1")
+        .header("x-codex-turn-metadata", r#"{"thread_source":"cli"}"#)
+        .header("x-openai-internal-codex-responses-lite", "true")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 101);
+
+    // Check upstream WS handshake request headers.
+    let captured = f.mock.websocket_headers.lock().unwrap();
+    assert_eq!(captured.len(), 1);
+    let upstream_ws_headers = &captured[0];
+    assert_eq!(upstream_ws_headers["authorization"], "Bearer key-a");
+    for (name, value) in [
+        ("openai-beta", "responses_websockets=2026-02-06"),
+        ("originator", "codex_cli_rs"),
+        ("session-id", "ws-sess-1"),
+        ("thread-id", "ws-thread-1"),
+        ("x-codex-turn-state", "ws-turn-req-1"),
+        ("x-codex-turn-metadata", r#"{"thread_source":"cli"}"#),
+        ("x-openai-internal-codex-responses-lite", "true"),
+    ] {
+        assert_eq!(
+            upstream_ws_headers.get(name).and_then(|v| v.to_str().ok()),
+            Some(value),
+            "expected WS request header {name} to be forwarded"
+        );
+    }
+    for stripped in [
+        "x-newapi-key",
+        "cookie",
+        "chatgpt-account-id",
+        "x-openai-account-routing-override",
+        "x-codex-installation-id",
+    ] {
+        assert!(
+            !upstream_ws_headers.contains_key(stripped),
+            "WS request header {stripped} must not be forwarded"
+        );
+    }
+
+    // Check 101 WS response headers returned to the client.
+    let resp_headers = response.headers();
+    for (name, value) in [
+        ("sec-websocket-accept", "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="),
+        ("x-codex-turn-state", "ws-turn-state-1"),
+        ("x-codex-websocket-max-message-bytes", "16777216"),
+        ("openai-model", "gpt-5.4"),
+        ("x-reasoning-included", "true"),
+        ("x-oai-request-id", "oai-ws-req-1"),
+    ] {
+        assert_eq!(
+            resp_headers.get(name).and_then(|v| v.to_str().ok()),
+            Some(value),
+            "expected WS 101 response header {name} to be forwarded"
+        );
+    }
+    for stripped in ["set-cookie", "x-models-etag"] {
+        assert!(
+            !resp_headers.contains_key(stripped),
+            "WS 101 response header {stripped} must be stripped"
+        );
     }
 }

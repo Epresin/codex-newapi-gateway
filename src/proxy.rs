@@ -9,11 +9,126 @@ use axum::{
 };
 use futures_util::StreamExt;
 use std::{
+    collections::BTreeSet,
     io::Read,
     sync::{Arc, RwLock},
     time::{Duration, Instant},
 };
 use tokio_util::sync::CancellationToken;
+
+// Exact allowlist of non-credential Codex/New API/CLIProxyAPI request headers shared by HTTP and WS.
+const COMMON_FORWARD_REQUEST_HEADERS: &[&str] = &[
+    "x-forwarded-for",
+    "x-real-ip",
+    "openai-beta",
+    "originator",
+    "version",
+    "session-id",
+    "session_id",
+    "thread-id",
+    "conversation_id",
+    "x-codex-turn-state",
+    "x-codex-turn-metadata",
+    "x-client-request-id",
+    "x-openai-internal-codex-responses-lite",
+    "x-codex-beta-features",
+    "x-openai-subagent",
+    "x-codex-window-id",
+    "x-codex-parent-thread-id",
+    "x-codex-guardian",
+    "x-codex-routing-hint",
+];
+
+const HTTP_FORWARD_REQUEST_HEADERS: &[&str] = &[
+    "content-type",
+    "content-encoding",
+    "content-length",
+    "accept",
+];
+
+const WS_FORWARD_REQUEST_HEADERS: &[&str] = &[
+    "sec-websocket-key",
+    "sec-websocket-version",
+    "sec-websocket-protocol",
+    "sec-websocket-extensions",
+];
+
+// Security/protocol denylist for upstream response headers (HTTP, WS errors, and WS 101 upgrades).
+const STRIPPED_RESPONSE_HEADERS: &[&str] = &[
+    // RFC hop-by-hop headers
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailer",
+    "trailers",
+    "transfer-encoding",
+    "upgrade",
+    // Framing header managed by the gateway server for streamed/upgraded bodies
+    "content-length",
+    // Auth, cookie, transport security, and CORS isolation headers
+    "set-cookie",
+    "www-authenticate",
+    "strict-transport-security",
+    "access-control-allow-origin",
+    "access-control-allow-credentials",
+    "access-control-allow-headers",
+    "access-control-allow-methods",
+    "access-control-expose-headers",
+    "access-control-max-age",
+    // Gateway owns /models catalog generation; never expose upstream catalog ETags
+    "x-models-etag",
+];
+
+fn forward_request_headers(
+    mut outgoing: reqwest::RequestBuilder,
+    incoming: &HeaderMap,
+    key_header: &str,
+    extra_allowed: &[&str],
+) -> reqwest::RequestBuilder {
+    for &name in COMMON_FORWARD_REQUEST_HEADERS
+        .iter()
+        .chain(extra_allowed.iter())
+    {
+        if name.eq_ignore_ascii_case(key_header) {
+            continue;
+        }
+        for value in incoming.get_all(name) {
+            outgoing = outgoing.header(name, value);
+        }
+    }
+    outgoing
+}
+
+fn append_filtered_response_headers(
+    mut builder: axum::http::response::Builder,
+    upstream: &HeaderMap,
+    strip_cache_control: bool,
+) -> axum::http::response::Builder {
+    let mut dynamic_hop_by_hop = BTreeSet::new();
+    for value in upstream.get_all("connection") {
+        if let Ok(text) = value.to_str() {
+            for token in text.split(',') {
+                let token = token.trim().to_ascii_lowercase();
+                if !token.is_empty() {
+                    dynamic_hop_by_hop.insert(token);
+                }
+            }
+        }
+    }
+    for (name, value) in upstream {
+        let lower = name.as_str();
+        if STRIPPED_RESPONSE_HEADERS.contains(&lower)
+            || dynamic_hop_by_hop.contains(lower)
+            || (strip_cache_control && lower == "cache-control")
+        {
+            continue;
+        }
+        builder = builder.header(name, value);
+    }
+    builder
+}
 
 #[derive(Clone)]
 pub struct ProxyState {
@@ -129,20 +244,12 @@ async fn forward_websocket(
         .header("authorization", auth)
         .header("connection", "upgrade")
         .header("upgrade", "websocket");
-    for name in [
-        "sec-websocket-key",
-        "sec-websocket-version",
-        "sec-websocket-protocol",
-        "sec-websocket-extensions",
-        "openai-beta",
-        "originator",
-        "x-forwarded-for",
-        "x-real-ip",
-    ] {
-        if let Some(value) = parts.headers.get(name) {
-            request = request.header(name, value);
-        }
-    }
+    request = forward_request_headers(
+        request,
+        &parts.headers,
+        &state.config.auth.key_header,
+        WS_FORWARD_REQUEST_HEADERS,
+    );
     let response = tokio::select! {
         _ = state.cancel.cancelled() => return error(StatusCode::SERVICE_UNAVAILABLE, "Gateway stopping"),
         r = request.send() => match r {
@@ -170,30 +277,23 @@ async fn forward_websocket(
                 "New API did not upgrade the WebSocket connection",
             );
         }
-        let mut builder = Response::builder().status(status);
-        for name in ["content-type", "retry-after", "x-request-id"] {
-            if let Some(value) = response.headers().get(name) {
-                builder = builder.header(name, value);
-            }
-        }
+        let builder = append_filtered_response_headers(
+            Response::builder().status(status),
+            response.headers(),
+            false,
+        );
         return builder
             .body(Body::from_stream(response.bytes_stream()))
             .unwrap();
     }
-    let mut builder = Response::builder()
-        .status(StatusCode::SWITCHING_PROTOCOLS)
-        .header("connection", "upgrade")
-        .header("upgrade", "websocket");
-    for name in [
-        "sec-websocket-accept",
-        "sec-websocket-protocol",
-        "sec-websocket-extensions",
-        "x-request-id",
-    ] {
-        if let Some(value) = response.headers().get(name) {
-            builder = builder.header(name, value);
-        }
-    }
+    let builder = append_filtered_response_headers(
+        Response::builder()
+            .status(StatusCode::SWITCHING_PROTOCOLS)
+            .header("connection", "upgrade")
+            .header("upgrade", "websocket"),
+        response.headers(),
+        false,
+    );
     let mut upstream = match response.upgrade().await {
         Ok(s) => s,
         Err(_) => return error(StatusCode::BAD_GATEWAY, "New API WebSocket upgrade failed"),
@@ -371,18 +471,12 @@ async fn forward_inner(state: &ProxyState, mut request: Request) -> Response {
         .client
         .request(parts.method, &target)
         .header("authorization", auth);
-    for name in [
-        "content-type",
-        "content-encoding",
-        "content-length",
-        "accept",
-        "x-forwarded-for",
-        "x-real-ip",
-    ] {
-        if let Some(value) = parts.headers.get(name) {
-            outgoing = outgoing.header(name, value);
-        }
-    }
+    outgoing = forward_request_headers(
+        outgoing,
+        &parts.headers,
+        &state.config.auth.key_header,
+        HTTP_FORWARD_REQUEST_HEADERS,
+    );
     outgoing = outgoing.body(reqwest::Body::wrap_stream(body.into_data_stream()));
     let response = tokio::select! {
         _ = state.cancel.cancelled() => return error(StatusCode::SERVICE_UNAVAILABLE, "Gateway stopping"),
@@ -433,18 +527,11 @@ async fn forward_inner(state: &ProxyState, mut request: Request) -> Response {
             ),
         };
     }
-    let mut builder = Response::builder().status(response.status());
-    for name in [
-        "content-type",
-        "content-encoding",
-        "cache-control",
-        "retry-after",
-        "x-request-id",
-    ] {
-        if let Some(value) = response.headers().get(name) {
-            builder = builder.header(name, value);
-        }
-    }
+    let mut builder = append_filtered_response_headers(
+        Response::builder().status(response.status()),
+        response.headers(),
+        is_models,
+    );
     if is_models {
         builder = builder.header("cache-control", "no-store");
     }
